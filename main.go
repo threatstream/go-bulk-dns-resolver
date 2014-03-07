@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"time"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
-	//"bulkdns"
 	"github.com/miekg/dns"
 )
 
@@ -29,9 +29,12 @@ type (
 var (
 	inputCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
 
+	// More public DNS servers: https://www.grc.com/dns/alternatives.htm
 	ring = DnsServerRing{-1, []string{
 		"8.8.8.8", // Google - CA
 		"8.8.4.4", // Google - CA
+		"129.250.35.250", // Verio
+		"129.250.35.251", // Verio
 		"209.244.0.3", // Level3 - CA
 		"209.244.0.4", // Level3 - CA
 		"4.2.2.1", // Verizon
@@ -42,14 +45,16 @@ var (
 		"23.226.230.72", // OpenNIC - WA
 	}}
 
-	ch = make(chan Result)
+	ch = make(chan Result, 1000)
 )
+
 
 const (
-	MAX_ATTEMPTS = 5
+	MAX_ATTEMPTS = 10
 )
 
 
+// TODO: protect this region to be accessible by only 1 thread at a time.
 func (this *DnsServerRing) next() string {
 	if this.index < 0 || this.index + 1 == len(this.servers) {
 		this.index = 0
@@ -61,6 +66,7 @@ func (this *DnsServerRing) next() string {
 
 
 func resolve(domain string, dnsServer string, attemptNumber int) {
+	//fmt.Printf("started resolving " + domain + "\n")
 	m := new(dns.Msg)
 	m.SetQuestion(domain + ".", dns.TypeA & dns.TypeCNAME)
 	c := new(dns.Client)
@@ -70,15 +76,17 @@ func resolve(domain string, dnsServer string, attemptNumber int) {
 		//fmt.Printf("notice :: %s\n", err)
 		if attemptNumber < MAX_ATTEMPTS {
 			resolve(domain, ring.next(), attemptNumber + 1)
+			return
 		} else {
 			fmt.Printf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
 		}
 	}
 
 	if msg.String() == "<nil> MsgHdr" {
-		if attemptNumber < MAX_ATTEMPTS { // && strings.Contains(domain, "onclickads.net") {
-			//fmt.Printf("!!!!!!!!!! JAY !!!!!!!!!!!!!! RETRYING %s: %s\n", domain, msg.String())
+		if attemptNumber < MAX_ATTEMPTS {
+			//fmt.Printf("RETRYING %s: %s\n", domain, msg.String())
 			resolve(domain, ring.next(), attemptNumber + 1)
+			return
 		} else {
 			fmt.Printf("failed :: max attempts exhausted for domain=%s\n", domain)
 		}
@@ -88,59 +96,65 @@ func resolve(domain string, dnsServer string, attemptNumber int) {
 }
 
 
+func worker(linkChan chan string, wg *sync.WaitGroup) {
+	// Decreasing internal counter for wait-group as soon as goroutine finishes
+	defer wg.Done()
+
+	for domain := range linkChan {
+		// Analyze value and do the job here
+		resolve(domain, ring.next(), 1)
+	}
+	//fmt.Printf("ALL DONE!\n")
+}
+
+
 func main() {
 
 	domains := readLinesFromStdin(func(line string) string {
 		return strings.TrimSpace(inputCleanerRe.ReplaceAllString(line, "$1"))
 	})
 
-	//fmt.Println(domains)
+	tasks := make(chan string, 250)//len(domains))
 
-	for _, domain := range domains {
-		go resolve(domain, ring.next(), 1)
+	// Spawn worker goroutines.
+	wg := new(sync.WaitGroup)
+
+	// Adding routines to workgroup and running then.
+	for i := 0; i < 250; i++ {
+		wg.Add(1)
+		go worker(tasks, wg)
 	}
-	/*for _, domain := range domains {
-		fmt.Println("------- " + domain)
-	}*/
-	i := 0
 
+	receiver := func() {
+		i := 0
 Loop:
-	for {
-		select {
-		case result := <-ch:
-			//log.Println(result.msg)
-			domain, ips, err := ParseResponse(result.domain, result.msg.String())
-			if err != nil {
-				fmt.Printf("failed :: domain=%s :: dns-server=%s :: error=%s", result.domain, result.dnsServer, err.Error())
-			}
-			fmt.Printf("%s %s\n", domain, strings.Join(ips, " "))
-			/*if i == 0 {
-				first = result
-				fmt.Println(first.msg)
-			} else {
-				if first.rtt != result.rtt {
-					fmt.Println("All rtt should be equal")
-					return
-					//t.Fail()
+		for {
+			select {
+			case result := <-ch:
+				//log.Println(result.msg)
+				domain, ips, err := ParseResponse(result.domain, result.msg.String())
+				if err != nil && len(ips) == 0 {
+					fmt.Printf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
+				} else if len(ips) > 0 {
+					fmt.Printf("%s %s\n", domain, strings.Join(ips, " "))
 				}
-			}*/
-			i++
-			if i == len(domains) {
-				break Loop
+				i++
+				if i == len(domains) {
+					break Loop
+				}
 			}
 		}
 	}
-	//fmt.Println("done")
-	/*args := os.Args
-	if len(args) < 2 {
-		fmt.Fatalln("expected at least one argument")
-		return
-	}
-	switch args[1] {
-	case "server":
-		fmt.Println(new(Server).start())
-	default:
-		new(Client).Do(args)
-	}*/
 
+	go receiver()
+
+	// Processing all links by spreading them to `free` goroutines
+	for _, domain := range domains {
+		tasks <- domain
+	}
+
+	close(tasks)
+
+	// Wait for the workers to finish.
+	wg.Wait()
 }

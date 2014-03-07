@@ -3,7 +3,7 @@ Go Bulk DNS Resolver
 
 About
 -----
-High-performance lightning-fast DNS resolution tool written in [Go](http://golang.org/).
+Lightning-fast high-performance bulk DNS resolution tool written in [Go](http://golang.org/) based on [miekg/dns](https://github.com/miekg/dns).
 
 Building
 --------
