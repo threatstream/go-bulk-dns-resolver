@@ -2,17 +2,20 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/timtadh/getopt"
 )
 
 type (
 	Result struct {
 		domain string
+		originalLine string
 		dnsServer string
 		msg *dns.Msg
 		rtt time.Duration
@@ -29,7 +32,9 @@ type (
 var (
 	inputCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
 
-	// More public DNS servers: https://www.grc.com/dns/alternatives.htm
+	// More public DNS servers:
+	//     https://www.grc.com/dns/alternatives.htm
+	//     http://www.bestfreedns.net/
 	ring = DnsServerRing{-1, []string{
 		"8.8.8.8", // Google - CA
 		"8.8.4.4", // Google - CA
@@ -46,11 +51,16 @@ var (
 	}}
 
 	ch = make(chan Result, 1000)
+
+	// Preserve input line (if this is true then don't cleanup and reduce to just the domain name).
+	preserveInput = false
 )
 
 
 const (
 	MAX_ATTEMPTS = 10
+
+	CONCURRENCY = 1000
 )
 
 
@@ -65,8 +75,9 @@ func (this *DnsServerRing) next() string {
 }
 
 
-func resolve(domain string, dnsServer string, attemptNumber int) {
+func resolve(line string, dnsServer string, attemptNumber int) {
 	//fmt.Printf("started resolving " + domain + "\n")
+	domain := inputCleanerRe.ReplaceAllString(line, "$1")
 	m := new(dns.Msg)
 	m.SetQuestion(domain + ".", dns.TypeA & dns.TypeCNAME)
 	c := new(dns.Client)
@@ -92,7 +103,7 @@ func resolve(domain string, dnsServer string, attemptNumber int) {
 		}
 	}
 	//fmt.Printf(dnsServer + "\n")
-	ch <- Result{domain, dnsServer, msg, rtt, err}
+	ch <- Result{domain, line, dnsServer, msg, rtt, err}
 }
 
 
@@ -110,17 +121,32 @@ func worker(linkChan chan string, wg *sync.WaitGroup) {
 
 func main() {
 
-	domains := readLinesFromStdin(func(line string) string {
-		return strings.TrimSpace(inputCleanerRe.ReplaceAllString(line, "$1"))
+	// Parse and validate args.
+	leftovers, optargs, err := getopt.GetOpt(os.Args[1:], "p", []string{"preserve"})
+	if err != nil {
+		fmt.Printf("error: %s\n", err)
+		return
+	} else if len(leftovers) > 0 {
+		fmt.Printf("error: unrecognized parameter: %s\n", leftovers)
+		return
+	}
+	if len(optargs) > 0 && optargs[0].Opt() == "-p" {
+		//fmt.Printf("Found opt!\n")
+		preserveInput = true
+	}
+
+
+	domains := ReadLinesFromStdin(func(line string) string {
+		return strings.TrimSpace(line)
 	})
 
-	tasks := make(chan string, 250)//len(domains))
+	tasks := make(chan string, CONCURRENCY)//len(domains))
 
 	// Spawn worker goroutines.
 	wg := new(sync.WaitGroup)
 
 	// Adding routines to workgroup and running then.
-	for i := 0; i < 250; i++ {
+	for i := 0; i < CONCURRENCY; i++ {
 		wg.Add(1)
 		go worker(tasks, wg)
 	}
@@ -136,7 +162,11 @@ Loop:
 				if err != nil && len(ips) == 0 {
 					fmt.Printf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
 				} else if len(ips) > 0 {
-					fmt.Printf("%s %s\n", domain, strings.Join(ips, " "))
+					if preserveInput {
+						fmt.Printf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+					} else {
+						fmt.Printf("%s %s\n", domain, strings.Join(ips, " "))
+					}
 				}
 				i++
 				if i == len(domains) {

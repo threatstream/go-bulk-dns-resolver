@@ -16,3 +16,7 @@ The input is a newline-delimited list of domain names or URLs.  The output will 
     echo 'google.com' | ./bulkdns
 	google.com 74.125.239.34 74.125.239.46 74.125.239.38 74.125.239.33 74.125.239.36 74.125.239.35 74.125.239.40 74.125.239.39 74.125.239.32 74.125.239.37 74.125.239.41
 
+Options
+-------
+`-p` will keep the output prefix exactly like the input prefix.  By default, the behavior is to prefix the output with only the domain name.
+

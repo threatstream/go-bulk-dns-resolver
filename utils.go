@@ -23,7 +23,7 @@ func Append(slice []string, elements ...string) []string {
     return slice
 }
 
-func readLinesFromStdin(fn func(string) string) []string {
+func ReadLinesFromStdin(fn func(string) string) []string {
     reader := bufio.NewReader(os.Stdin)
     lines := []string{}
     for {
