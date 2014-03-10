@@ -17,7 +17,7 @@ type (
 		domain string
 		originalLine string
 		dnsServer string
-		msg *dns.Msg
+		response *dns.Msg
 		rtt time.Duration
 		err error
 	}
@@ -29,13 +29,20 @@ type (
 )
 
 
+const (
+	MAX_ATTEMPTS = 10
+
+	CONCURRENCY = 1000
+)
+
+
 var (
-	inputCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
+	domainCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
 
 	// More public DNS servers:
 	//     https://www.grc.com/dns/alternatives.htm
 	//     http://www.bestfreedns.net/
-	ring = DnsServerRing{-1, []string{
+	/**/ring = DnsServerRing{-1, []string{
 		"8.8.8.8", // Google - CA
 		"8.8.4.4", // Google - CA
 		"129.250.35.250", // Verio
@@ -48,19 +55,28 @@ var (
 		"172.246.141.148", // OpenNIC - CA
 		"23.90.4.6", // OpenNIC - AZ
 		"23.226.230.72", // OpenNIC - WA
-	}}
+	}}/**/
+	/*// Comcast DNS.
+	ring = DnsServerRing{-1, []string{
+		"68.87.85.98", // West Coast
+		"68.87.76.178", // Sacramento Primary
+		"68.87.78.130", // Sacramento Secondary
+		"68.87.76.178", // San Francisco Primary
+		"68.87.78.130", // San Francisco Secondary
+		"68.87.76.178", // Los Angeles Primary
+		"68.87.78.130", // Los Angeles Secondary
+		"68.87.69.146", // Orgeon Primary
+		"68.87.85.98", // Orgeon Secondary
+		"68.87.85.98", // Utah Primary
+		"68.87.69.146", // Utah Secondary
+	}}*/
 
-	ch = make(chan Result, 1000)
+	ch = make(chan Result, CONCURRENCY)
 
 	// Preserve input line (if this is true then don't cleanup and reduce to just the domain name).
 	preserveInput = false
-)
 
-
-const (
-	MAX_ATTEMPTS = 10
-
-	CONCURRENCY = 1000
+	outputLock sync.Mutex
 )
 
 
@@ -76,34 +92,35 @@ func (this *DnsServerRing) next() string {
 
 
 func resolve(line string, dnsServer string, attemptNumber int) {
-	//fmt.Printf("started resolving " + domain + "\n")
-	domain := inputCleanerRe.ReplaceAllString(line, "$1")
+	//SyncPrintf("started resolving line=%s\n", line)
+	domain := domainCleanerRe.ReplaceAllString(line, "$1")
 	m := new(dns.Msg)
 	m.SetQuestion(domain + ".", dns.TypeA & dns.TypeCNAME)
 	c := new(dns.Client)
-	msg, rtt, err := c.Exchange(m, dnsServer + ":53")
+	response, rtt, err := c.Exchange(m, dnsServer + ":53")
 
 	if err != nil {
-		//fmt.Printf("notice :: %s\n", err)
+		//SyncPrintf("notice :: %s\n", err)
 		if attemptNumber < MAX_ATTEMPTS {
-			resolve(domain, ring.next(), attemptNumber + 1)
+			resolve(line, ring.next(), attemptNumber + 1)
 			return
 		} else {
-			fmt.Printf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
+			SyncPrintf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
 		}
 	}
 
-	if msg.String() == "<nil> MsgHdr" {
+	messageHeader := response.String()
+	if messageHeader == "<nil> MsgHdr" || !answerBlockRe.MatchString(messageHeader) {
 		if attemptNumber < MAX_ATTEMPTS {
-			//fmt.Printf("RETRYING %s: %s\n", domain, msg.String())
-			resolve(domain, ring.next(), attemptNumber + 1)
+			//SyncPrintf("RETRYING %s: %s\n", domain, response.String())
+			resolve(line, ring.next(), attemptNumber + 1)
 			return
 		} else {
-			fmt.Printf("failed :: max attempts exhausted for domain=%s\n", domain)
+			SyncPrintf("failed :: no answer found for domain=%s, max attempts exhausted\n", domain)
 		}
 	}
-	//fmt.Printf(dnsServer + "\n")
-	ch <- Result{domain, line, dnsServer, msg, rtt, err}
+	//SyncPrintf(dnsServer + "\n")
+	ch <- Result{domain, line, dnsServer, response, rtt, err}
 }
 
 
@@ -115,7 +132,14 @@ func worker(linkChan chan string, wg *sync.WaitGroup) {
 		// Analyze value and do the job here
 		resolve(domain, ring.next(), 1)
 	}
-	//fmt.Printf("ALL DONE!\n")
+	//SyncPrintf("ALL DONE!\n")
+}
+
+func SyncPrintf(msg string, args... interface{}) {
+	outputLock.Lock()
+	fmt.Printf(msg, args...)
+	os.Stdout.Sync()
+	outputLock.Unlock()
 }
 
 
@@ -124,16 +148,17 @@ func main() {
 	// Parse and validate args.
 	leftovers, optargs, err := getopt.GetOpt(os.Args[1:], "p", []string{"preserve"})
 	if err != nil {
-		fmt.Printf("error: %s\n", err)
+		SyncPrintf("error: %s\n", err)
 		return
 	} else if len(leftovers) > 0 {
-		fmt.Printf("error: unrecognized parameter: %s\n", leftovers)
+		SyncPrintf("error: unrecognized parameter: %s\n", leftovers)
 		return
 	}
 	if len(optargs) > 0 && optargs[0].Opt() == "-p" {
-		//fmt.Printf("Found opt!\n")
+		//SyncPrintf("Found opt!\n")
 		preserveInput = true
 	}
+	
 
 
 	domains := ReadLinesFromStdin(func(line string) string {
@@ -151,32 +176,35 @@ func main() {
 		go worker(tasks, wg)
 	}
 
-	receiver := func() {
+	receiver := func(numDomains int) {
+		defer wg.Done()
+
 		i := 0
 Loop:
 		for {
 			select {
 			case result := <-ch:
-				//log.Println(result.msg)
-				domain, ips, err := ParseResponse(result.domain, result.msg.String())
+				//log.Println(result.response)
+				domain, ips, err := ParseResponse(result.domain, result.response.String())
 				if err != nil && len(ips) == 0 {
-					fmt.Printf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
+					SyncPrintf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
 				} else if len(ips) > 0 {
 					if preserveInput {
-						fmt.Printf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
 					} else {
-						fmt.Printf("%s %s\n", domain, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", domain, strings.Join(ips, " "))
 					}
 				}
 				i++
-				if i == len(domains) {
+				if i == numDomains {
 					break Loop
 				}
 			}
 		}
 	}
 
-	go receiver()
+	wg.Add(1)
+	go receiver(len(domains))
 
 	// Processing all links by spreading them to `free` goroutines
 	for _, domain := range domains {
