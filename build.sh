@@ -8,6 +8,9 @@
 
 cd "$(dirname "$0")"
 
+# Test for and require a non-empty $GOPATH variable (necessary for dependencies to be successfully detected and retrieved automatically.
+test -z "${GOPATH}" && echo 'error: missing required environment variable $GOPATH, read http://golang.org/doc/code.html?d96a349c52fc4f68eea46a47ccb3d360#GOPATH for more information' 1>&2 && exit 1
+
 if test "$1" == '-u' || test "$1" == '--update'; then
     forceUpdate=1
     echo 'info: dependency update will be forced'
