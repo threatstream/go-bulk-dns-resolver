@@ -14,27 +14,25 @@ import (
 
 type (
 	Result struct {
-		domain string
+		domain       string
 		originalLine string
-		dnsServer string
-		response *dns.Msg
-		rtt time.Duration
-		err error
+		dnsServer    string
+		response     *dns.Msg
+		rtt          time.Duration
+		err          error
 	}
 
 	DnsServerRing struct {
-		index int
-		servers []string
+		Index   int
+		Servers []string
 	}
 )
-
 
 const (
 	MAX_ATTEMPTS = 10
 
-	CONCURRENCY = 1000
+	CONCURRENCY = 250 //000 //250
 )
-
 
 var (
 	domainCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
@@ -42,20 +40,31 @@ var (
 	// More public DNS servers:
 	//     https://www.grc.com/dns/alternatives.htm
 	//     http://www.bestfreedns.net/
-	/**/ring = DnsServerRing{-1, []string{
-		"8.8.8.8", // Google - CA
-		"8.8.4.4", // Google - CA
-		"129.250.35.250", // Verio
-		"129.250.35.251", // Verio
-		"209.244.0.3", // Level3 - CA
-		"209.244.0.4", // Level3 - CA
-		"4.2.2.1", // Verizon
-		"4.2.2.2", // Verizon
-		"173.230.156.28", // OpenNIC - CA
+	/**/ ring = DnsServerRing{-1, []string{
+		"8.8.8.8",         // Google - CA
+		"8.8.4.4",         // Google - CA
+		"129.250.35.250",  // Verio
+		"129.250.35.251",  // Verio
+		"209.244.0.3",     // Level3 - CA
+		"209.244.0.4",     // Level3 - CA
+		"4.2.2.1",         // Verizon
+		"4.2.2.2",         // Verizon
+		"173.230.156.28",  // OpenNIC - CA
 		"172.246.141.148", // OpenNIC - CA
-		"23.90.4.6", // OpenNIC - AZ
-		"23.226.230.72", // OpenNIC - WA
-	}}/**/
+		"23.90.4.6",       // OpenNIC - AZ
+		"23.226.230.72",   // OpenNIC - WA
+		"68.87.85.98",     // Comcast: West Coast
+		"68.87.76.178",    // Comcast: Sacramento Primary
+		"68.87.78.130",    // Comcast: Sacramento Secondary
+		"68.87.76.178",    // Comcast: San Francisco Primary
+		"68.87.78.130",    // Comcast: San Francisco Secondary
+		"68.87.76.178",    // Comcast: Los Angeles Primary
+		"68.87.78.130",    // Comcast: Los Angeles Secondary
+		"68.87.69.146",    // Comcast: Orgeon Primary
+		"68.87.85.98",     // Comcast: Orgeon Secondary
+		"68.87.85.98",     // Comcast: Utah Primary
+		"68.87.69.146",    // Comcast: Utah Secondary
+	}} /**/
 	/*// Comcast DNS.
 	ring = DnsServerRing{-1, []string{
 		"68.87.85.98", // West Coast
@@ -79,71 +88,104 @@ var (
 	outputLock sync.Mutex
 )
 
-
 // TODO: protect this region to be accessible by only 1 thread at a time.
-func (this *DnsServerRing) next() string {
-	if this.index < 0 || this.index + 1 == len(this.servers) {
-		this.index = 0
+func (this *DnsServerRing) Next() string {
+	if this.Index < 0 || this.Index+1 == len(this.Servers) {
+		this.Index = 0
 	} else {
-		this.index++
+		this.Index++
 	}
-	return this.servers[this.index]
+	return this.Servers[this.Index]
 }
 
+func (this *DnsServerRing) Test() {
+	domain := "google.com"
+	m := new(dns.Msg)
+	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
+	c := new(dns.Client)
+	working := []string{}
+	for _, server := range this.Servers {
+		response, rtt, err := c.Exchange(m, server+":53")
+		fmt.Printf("rtt=%v\n", rtt)
+		if err != nil {
+			fmt.Printf("error, server=%v: %v\n", server, err)
+		} else {
+			fmt.Printf("good server: %v\n", server)
+			working = Append(working, server)
+		}
+		if 1 == 2 {
+			fmt.Printf("%v\n", response)
+		}
+	}
+	this.Servers = working
+}
 
-func resolve(line string, dnsServer string, attemptNumber int) {
+func (this *DnsServerRing) Resolve(domain string) (*dns.Msg, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
+	c := new(dns.Client)
+	response, rtt, err := c.Exchange(m, this.Next()+":53")
+	fmt.Printf("rtt=%v\n", rtt)
+	if err != nil && strings.Contains(err.Error(), "i/o timeout") {
+		return this.Resolve(domain)
+	} else if err != nil {
+		return nil, fmt.Errorf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
+	}
+	if response.Rcode != dns.RcodeSuccess {
+		fmt.Printf("Rcode wasn't success: %v\n", response.Rcode)
+	}
+	return response, nil
+}
+
+func resolve(line string, dnsServer string, numAttempts int) {
 	//SyncPrintf("started resolving line=%s\n", line)
 	domain := domainCleanerRe.ReplaceAllString(line, "$1")
 	m := new(dns.Msg)
-	m.SetQuestion(domain + ".", dns.TypeA & dns.TypeCNAME)
+	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
 	c := new(dns.Client)
-	response, rtt, err := c.Exchange(m, dnsServer + ":53")
+	response, rtt, err := c.Exchange(m, dnsServer+":53")
 
-	if err != nil {
+	if err != nil && strings.Contains(err.Error(), "i/o timeout") {
+		resolve(line, ring.Next(), numAttempts+1)
+		return
 		//SyncPrintf("notice :: %s\n", err)
-		if attemptNumber < MAX_ATTEMPTS {
-			resolve(line, ring.next(), attemptNumber + 1)
-			return
-		} else {
-			SyncPrintf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
-		}
-	}
+	} /* else if err != nil {
+		SyncPrintf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
+	}*/
 
 	messageHeader := response.String()
 	if messageHeader == "<nil> MsgHdr" || !answerBlockRe.MatchString(messageHeader) {
-		if attemptNumber < MAX_ATTEMPTS {
-			//SyncPrintf("RETRYING %s: %s\n", domain, response.String())
-			resolve(line, ring.next(), attemptNumber + 1)
+		if numAttempts < 5 {
+			resolve(line, ring.Next(), numAttempts+1)
 			return
 		} else {
-			SyncPrintf("failed :: no answer found for domain=%s, max attempts exhausted\n", domain)
+			SyncPrintf("failed :: no answer found for domain=%s\n", domain)
 		}
 	}
 	//SyncPrintf(dnsServer + "\n")
 	ch <- Result{domain, line, dnsServer, response, rtt, err}
 }
 
-
-func worker(linkChan chan string, wg *sync.WaitGroup) {
+func Worker(linkChan chan string, wg *sync.WaitGroup) {
 	// Decreasing internal counter for wait-group as soon as goroutine finishes
 	defer wg.Done()
 
 	for domain := range linkChan {
 		// Analyze value and do the job here
-		resolve(domain, ring.next(), 1)
+		resolve(domain, ring.Next(), 1)
 	}
 	//SyncPrintf("ALL DONE!\n")
 }
 
-func SyncPrintf(msg string, args... interface{}) {
+func SyncPrintf(msg string, args ...interface{}) {
 	outputLock.Lock()
 	fmt.Printf(msg, args...)
 	os.Stdout.Sync()
 	outputLock.Unlock()
 }
 
-
 func main() {
+	ring.Test()
 
 	// Parse and validate args.
 	leftovers, optargs, err := getopt.GetOpt(os.Args[1:], "p", []string{"preserve"})
@@ -158,14 +200,12 @@ func main() {
 		//SyncPrintf("Found opt!\n")
 		preserveInput = true
 	}
-	
-
 
 	domains := ReadLinesFromStdin(func(line string) string {
 		return strings.TrimSpace(line)
 	})
 
-	tasks := make(chan string, CONCURRENCY)//len(domains))
+	tasks := make(chan string, CONCURRENCY) //len(domains))
 
 	// Spawn worker goroutines.
 	wg := new(sync.WaitGroup)
@@ -173,14 +213,14 @@ func main() {
 	// Adding routines to workgroup and running then.
 	for i := 0; i < CONCURRENCY; i++ {
 		wg.Add(1)
-		go worker(tasks, wg)
+		go Worker(tasks, wg)
 	}
 
 	receiver := func(numDomains int) {
 		defer wg.Done()
 
 		i := 0
-Loop:
+	Loop:
 		for {
 			select {
 			case result := <-ch:
