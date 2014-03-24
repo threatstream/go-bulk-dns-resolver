@@ -38,7 +38,7 @@ done
 
 echo 'info: compiling project'
 
-go build -o bulkdns main.go utils.go answer.go
+go build -o bulkdns main.go utils.go answer.go dnsserverring.go
 
 buildResult=$?
 

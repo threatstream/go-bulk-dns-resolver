@@ -13,6 +13,10 @@ import (
 )
 
 type (
+	Options struct {
+		// Preserve input line (if this is true then don't cleanup and reduce to just the domain name).
+		preserveInput bool
+	}
 	Result struct {
 		domain       string
 		originalLine string
@@ -21,26 +25,25 @@ type (
 		rtt          time.Duration
 		err          error
 	}
-
-	DnsServerRing struct {
-		Index   int
-		Servers []string
-	}
 )
 
 const (
-	MAX_ATTEMPTS = 10
-
-	CONCURRENCY = 250 //000 //250
+	CONCURRENCY = 1000 //000 //250
 )
 
 var (
+	options = Options{
+		preserveInput: false,
+	}
+
 	domainCleanerRe = regexp.MustCompile(`^(?:[0-9]+,)?([^\/]*)(?:\/.*)?$`)
+
+	ring DnsServerRing
 
 	// More public DNS servers:
 	//     https://www.grc.com/dns/alternatives.htm
 	//     http://www.bestfreedns.net/
-	/**/ ring = DnsServerRing{-1, []string{
+	extraServers = []string{
 		"8.8.8.8",         // Google - CA
 		"8.8.4.4",         // Google - CA
 		"129.250.35.250",  // Verio
@@ -64,77 +67,27 @@ var (
 		"68.87.85.98",     // Comcast: Orgeon Secondary
 		"68.87.85.98",     // Comcast: Utah Primary
 		"68.87.69.146",    // Comcast: Utah Secondary
-	}} /**/
-	/*// Comcast DNS.
-	ring = DnsServerRing{-1, []string{
-		"68.87.85.98", // West Coast
-		"68.87.76.178", // Sacramento Primary
-		"68.87.78.130", // Sacramento Secondary
-		"68.87.76.178", // San Francisco Primary
-		"68.87.78.130", // San Francisco Secondary
-		"68.87.76.178", // Los Angeles Primary
-		"68.87.78.130", // Los Angeles Secondary
-		"68.87.69.146", // Orgeon Primary
-		"68.87.85.98", // Orgeon Secondary
-		"68.87.85.98", // Utah Primary
-		"68.87.69.146", // Utah Secondary
-	}}*/
+	}
 
 	ch = make(chan Result, CONCURRENCY)
-
-	// Preserve input line (if this is true then don't cleanup and reduce to just the domain name).
-	preserveInput = false
 
 	outputLock sync.Mutex
 )
 
-// TODO: protect this region to be accessible by only 1 thread at a time.
-func (this *DnsServerRing) Next() string {
-	if this.Index < 0 || this.Index+1 == len(this.Servers) {
-		this.Index = 0
-	} else {
-		this.Index++
+// Initialize the ring and remove any servers that don't work.
+func init() {
+	clientConfig, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+	if err != nil {
+		panic(err)
 	}
-	return this.Servers[this.Index]
-}
-
-func (this *DnsServerRing) Test() {
-	domain := "google.com"
-	m := new(dns.Msg)
-	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
-	c := new(dns.Client)
-	working := []string{}
-	for _, server := range this.Servers {
-		response, rtt, err := c.Exchange(m, server+":53")
-		fmt.Printf("rtt=%v\n", rtt)
-		if err != nil {
-			fmt.Printf("error, server=%v: %v\n", server, err)
-		} else {
-			fmt.Printf("good server: %v\n", server)
-			working = Append(working, server)
-		}
-		if 1 == 2 {
-			fmt.Printf("%v\n", response)
-		}
+	ring = DnsServerRing{
+		Index:   -1,
+		Servers: Append(clientConfig.Servers, extraServers...),
 	}
-	this.Servers = working
-}
-
-func (this *DnsServerRing) Resolve(domain string) (*dns.Msg, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
-	c := new(dns.Client)
-	response, rtt, err := c.Exchange(m, this.Next()+":53")
-	fmt.Printf("rtt=%v\n", rtt)
-	if err != nil && strings.Contains(err.Error(), "i/o timeout") {
-		return this.Resolve(domain)
-	} else if err != nil {
-		return nil, fmt.Errorf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
+	err = ring.Test()
+	if err != nil {
+		panic(err)
 	}
-	if response.Rcode != dns.RcodeSuccess {
-		fmt.Printf("Rcode wasn't success: %v\n", response.Rcode)
-	}
-	return response, nil
 }
 
 func resolve(line string, dnsServer string, numAttempts int) {
@@ -143,25 +96,36 @@ func resolve(line string, dnsServer string, numAttempts int) {
 	m := new(dns.Msg)
 	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
 	c := new(dns.Client)
+	c.DialTimeout = 3e9
+	c.ReadTimeout = 5e9
+	c.WriteTimeout = 3e9
 	response, rtt, err := c.Exchange(m, dnsServer+":53")
 
-	if err != nil && strings.Contains(err.Error(), "i/o timeout") {
-		resolve(line, ring.Next(), numAttempts+1)
-		return
-		//SyncPrintf("notice :: %s\n", err)
-	} /* else if err != nil {
-		SyncPrintf("failed :: max attempts exhausted for domain=%s error=%s\n", domain, err)
-	}*/
-
-	messageHeader := response.String()
-	if messageHeader == "<nil> MsgHdr" || !answerBlockRe.MatchString(messageHeader) {
-		if numAttempts < 5 {
+	if err != nil {
+		if strings.Contains(err.Error(), IO_TIMEOUT_ERROR_MESSAGE) {
+			resolve(line, ring.Next(), numAttempts+1)
+			return
+		} else if numAttempts < len(ring.Servers)/2 {
 			resolve(line, ring.Next(), numAttempts+1)
 			return
 		} else {
-			SyncPrintf("failed :: no answer found for domain=%s\n", domain)
+			SyncPrintf("failed: max attempts exhausted for domain=%s error=%s\n", domain, err)
+		}
+	} else {
+		messageHeader := response.String()
+		if messageHeader == "<nil> MsgHdr" || !answerBlockRe.MatchString(messageHeader) {
+			if numAttempts < len(ring.Servers)/2 {
+				//fmt.Printf("retrying %v\n", domain)
+				resolve(line, ring.Next(), numAttempts+1)
+				return
+			} else {
+				SyncPrintf("failed: max attempts exhausted, no answer found for domain=%s\n", domain)
+			}
 		}
 	}
+	//for _, a := range response.Answer {
+	//	fmt.Printf("a=%v", a.String())
+	//}
 	//SyncPrintf(dnsServer + "\n")
 	ch <- Result{domain, line, dnsServer, response, rtt, err}
 }
@@ -185,8 +149,6 @@ func SyncPrintf(msg string, args ...interface{}) {
 }
 
 func main() {
-	ring.Test()
-
 	// Parse and validate args.
 	leftovers, optargs, err := getopt.GetOpt(os.Args[1:], "p", []string{"preserve"})
 	if err != nil {
@@ -198,7 +160,7 @@ func main() {
 	}
 	if len(optargs) > 0 && optargs[0].Opt() == "-p" {
 		//SyncPrintf("Found opt!\n")
-		preserveInput = true
+		options.preserveInput = true
 	}
 
 	domains := ReadLinesFromStdin(func(line string) string {
@@ -227,14 +189,14 @@ func main() {
 				//log.Println(result.response)
 				domain, ips, err := ParseResponse(result.domain, result.response.String())
 				if err != nil && len(ips) == 0 {
-					SyncPrintf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
-				} else if len(ips) > 0 {
-					if preserveInput {
-						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
-					} else {
-						SyncPrintf("%s %s\n", domain, strings.Join(ips, " "))
-					}
+					SyncPrintf("failed: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
+				} // else if len(ips) > 0 {
+				if options.preserveInput { // Always include input domains in output.
+					SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+				} else {
+					SyncPrintf("%s %s\n", domain, strings.Join(ips, " "))
 				}
+				//}
 				i++
 				if i == numDomains {
 					break Loop
