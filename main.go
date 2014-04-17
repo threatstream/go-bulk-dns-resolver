@@ -178,9 +178,14 @@ func main() {
 			case result := <-ch:
 				//log.Println(result.response)
 				domain, ips, err := ParseResponse(result.domain, result.response.String())
-				if err != nil && len(ips) == 0 {
+				if err != nil {
 					SyncPrintf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
-				} else if len(ips) > 0 {
+					if preserveInput {
+						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+					} else {
+						SyncPrintf("%s %s\n", result.domain, strings.Join(ips, " "))
+					}
+				} else {
 					if preserveInput {
 						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
 					} else {
