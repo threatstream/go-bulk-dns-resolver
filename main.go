@@ -40,7 +40,7 @@ var (
 	// More public DNS servers:
 	//     https://www.grc.com/dns/alternatives.htm
 	//     http://www.bestfreedns.net/
-	/**/ ring = DnsServerRing{-1, []string{
+	ring = DnsServerRing{-1, []string{
 		"8.8.8.8",         // Google - CA
 		"8.8.4.4",         // Google - CA
 		"129.250.35.250",  // Verio
@@ -53,21 +53,18 @@ var (
 		"172.246.141.148", // OpenNIC - CA
 		"23.90.4.6",       // OpenNIC - AZ
 		"23.226.230.72",   // OpenNIC - WA
-	}} /**/
-	/*// Comcast DNS.
-	ring = DnsServerRing{-1, []string{
-		"68.87.85.98", // West Coast
-		"68.87.76.178", // Sacramento Primary
-		"68.87.78.130", // Sacramento Secondary
-		"68.87.76.178", // San Francisco Primary
-		"68.87.78.130", // San Francisco Secondary
-		"68.87.76.178", // Los Angeles Primary
-		"68.87.78.130", // Los Angeles Secondary
-		"68.87.69.146", // Orgeon Primary
-		"68.87.85.98", // Orgeon Secondary
-		"68.87.85.98", // Utah Primary
-		"68.87.69.146", // Utah Secondary
-	}}*/
+		"68.87.85.98",     // Comcast West Coast
+		"68.87.76.178",    // Comcast Sacramento Primary
+		"68.87.78.130",    // Comcast Sacramento Secondary
+		"68.87.76.178",    // Comcast San Francisco Primary
+		"68.87.78.130",    // Comcast San Francisco Secondary
+		"68.87.76.178",    // Comcast Los Angeles Primary
+		"68.87.78.130",    // Comcast Los Angeles Secondary
+		"68.87.69.146",    // Comcast Orgeon Primary
+		"68.87.85.98",     // Comcast Orgeon Secondary
+		"68.87.85.98",     // Comcast Utah Primary
+		"68.87.69.146",    // Comcast Utah Secondary
+	}}
 
 	ch = make(chan Result, CONCURRENCY)
 
