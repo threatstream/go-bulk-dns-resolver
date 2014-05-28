@@ -5,6 +5,12 @@ About
 -----
 Lightning-fast high-performance bulk DNS resolution tool written in [Go](http://golang.org/) based on [miekg/dns](https://github.com/miekg/dns).
 
+Requirements
+------------
+    - OSX: `brew install update && brew install unbound`
+
+    - Linux: `sudo apt-get update && sudo apt-get install unbound libunbound-dev
+
 Building
 --------
     ./build.sh

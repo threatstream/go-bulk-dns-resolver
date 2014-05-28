@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/miekg/dns"
+	//"github.com/miekg/dns"
+	"github.com/miekg/unbound"
 	"github.com/timtadh/getopt"
 )
 
@@ -16,9 +17,7 @@ type (
 	Result struct {
 		domain       string
 		originalLine string
-		dnsServer    string
-		response     *dns.Msg
-		rtt          time.Duration
+		addresses    []string
 		err          error
 	}
 
@@ -29,9 +28,11 @@ type (
 )
 
 const (
-	MAX_ATTEMPTS = 10
+	MAX_ATTEMPTS = 3
 
-	CONCURRENCY = 1000
+	CONCURRENCY = 250 //1000
+
+	LOOKUP_TIMEOUT_SECONDS = 5
 )
 
 var (
@@ -72,7 +73,13 @@ var (
 	preserveInput = false
 
 	outputLock sync.Mutex
+
+	unboundInstance = unbound.New()
 )
+
+func init() {
+	unboundInstance.ResolvConf("/etc/resolv.conf")
+}
 
 // TODO: protect this region to be accessible by only 1 thread at a time.
 func (this *DnsServerRing) next() string {
@@ -84,11 +91,48 @@ func (this *DnsServerRing) next() string {
 	return this.servers[this.index]
 }
 
-func resolve(line string, dnsServer string, attemptNumber int) {
+func resolve(line string, attemptNumber int) {
+	domain := domainCleanerRe.ReplaceAllString(line, "$2")
+	// Clean out any trailing characters after the domain name (i.e. useful when a url is submitted *cough* Alexa).
+	cleanLine := domainCleanerRe.ReplaceAllString(line, "$1$2")
+	addresses := []string{}
+	var err error
+
+	timeout := make(chan error)
+	go func() {
+		addresses, err = unboundInstance.LookupHost(domain)
+		timeout <- err
+	}()
+
+	select {
+	case err = <-timeout:
+		if err != nil {
+			if attemptNumber < MAX_ATTEMPTS {
+				resolve(line, attemptNumber+1)
+				return
+			}
+			SyncPrintf("failed: max attempts exhausted for domain=%s error=%s\n", domain, err)
+		}
+	case <-time.After(LOOKUP_TIMEOUT_SECONDS * time.Second):
+		err = fmt.Errorf("error: timed out for \"%v\" after %v seconds", domain, LOOKUP_TIMEOUT_SECONDS)
+	}
+	ch <- Result{domain, cleanLine, addresses, err}
+}
+
+/*func resolveOldWay(line string, dnsServer string, attemptNumber int) {
 	//SyncPrintf("started resolving line=%s\n", line)
 	domain := domainCleanerRe.ReplaceAllString(line, "$2")
-	// Clean out any trailing characters after the domain name (i.e. useful when a url is submitted *cough* Alexa.
+	// Clean out any trailing characters after the domain name (i.e. useful when a url is submitted *cough* Alexa).
 	cleanLine := domainCleanerRe.ReplaceAllString(line, "$1$2")
+
+	u := unbound.New()
+	defer u.Destroy()
+	u.ResolvConf("/etc/resolv.conf")
+	a, err := u.LookupHost(domain)
+	if err != nil {
+		fmt.Printf("FAILURE: %v\n", err)
+	}
+	fmt.Printf("a=%v\n", a)
 
 	m := new(dns.Msg)
 	m.SetQuestion(domain+".", dns.TypeA&dns.TypeCNAME)
@@ -116,8 +160,12 @@ func resolve(line string, dnsServer string, attemptNumber int) {
 		}
 	}
 	//SyncPrintf(dnsServer + "\n")
-	ch <- Result{domain, cleanLine, dnsServer, response, rtt, err}
-}
+	_, addresses, err := ParseResponse(response.domain, response.response.String())
+	if err != nil {
+		fmt.Printf("failed :: response parser returned error: %v\n", err)
+	}
+	ch <- Result{domain, cleanLine, addresses, response, rtt, err}
+}*/
 
 func worker(linkChan chan string, wg *sync.WaitGroup) {
 	// Decreasing internal counter for wait-group as soon as goroutine finishes
@@ -125,7 +173,7 @@ func worker(linkChan chan string, wg *sync.WaitGroup) {
 
 	for domain := range linkChan {
 		// Analyze value and do the job here
-		resolve(domain, ring.next(), 1)
+		resolve(domain, 1)
 	}
 	//SyncPrintf("ALL DONE!\n")
 }
@@ -138,6 +186,8 @@ func SyncPrintf(msg string, args ...interface{}) {
 }
 
 func main() {
+	// Destroy after `main()` runs.
+	defer unboundInstance.Destroy()
 
 	// Parse and validate args.
 	leftovers, optargs, err := getopt.GetOpt(os.Args[1:], "p", []string{"preserve"})
@@ -156,6 +206,11 @@ func main() {
 	domains := ReadLinesFromStdin(func(line string) string {
 		return strings.TrimSpace(line)
 	})
+
+	resultMap := make(map[string]bool)
+	for _, d := range domains {
+		resultMap[d] = false
+	}
 
 	tasks := make(chan string, CONCURRENCY) //len(domains))
 
@@ -177,25 +232,32 @@ func main() {
 			select {
 			case result := <-ch:
 				//log.Println(result.response)
-				domain, ips, err := ParseResponse(result.domain, result.response.String())
+				//domain, ips, err := ParseResponse(result.domain, result.response.String())
 				if err != nil {
-					SyncPrintf("failed :: domain=%s :: dns-server=%s :: error=%s\n", result.domain, result.dnsServer, err.Error())
+					SyncPrintf("failed :: domain=%s :: error=%s\n", result.domain, err.Error())
 					if preserveInput {
-						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", result.originalLine, strings.Join(result.addresses, " "))
 					} else {
-						SyncPrintf("%s %s\n", result.domain, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", result.domain, strings.Join(result.addresses, " "))
 					}
 				} else {
 					if preserveInput {
-						SyncPrintf("%s %s\n", result.originalLine, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", result.originalLine, strings.Join(result.addresses, " "))
 					} else {
-						SyncPrintf("%s %s\n", domain, strings.Join(ips, " "))
+						SyncPrintf("%s %s\n", result.domain, strings.Join(result.addresses, " "))
 					}
 				}
+				resultMap[result.domain] = true
 				i++
+				//fmt.Printf("%v/%v\n", i, numDomains)
 				if i == numDomains {
 					break Loop
 				}
+				/*for d, _ := range resultMap {
+					if resultMap[d] == false {
+						fmt.Printf("still waiting on: %v\n", d)
+					}
+				}*/
 			}
 		}
 	}
