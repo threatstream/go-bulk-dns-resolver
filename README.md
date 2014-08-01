@@ -7,7 +7,7 @@ Lightning-fast high-performance bulk DNS resolution tool written in [Go](http://
 
 Requirements
 ------------
-    - OSX: `brew install update && brew install unbound`
+    - OSX: `brew update && brew install unbound`
 
     - Linux: `sudo apt-get update && sudo apt-get install unbound libunbound-dev
 
