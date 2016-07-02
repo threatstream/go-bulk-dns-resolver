@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"net"
 
 	//"github.com/miekg/dns"
 	"github.com/miekg/unbound"
@@ -100,7 +101,12 @@ func resolve(line string, attemptNumber int) {
 
 	timeout := make(chan error)
 	go func() {
-		addresses, err = unboundInstance.LookupHost(domain)
+		ip := net.ParseIP(domain)
+		if ip == nil {
+			addresses, err = unboundInstance.LookupHost(domain)
+		} else {
+			addresses, err = unboundInstance.LookupAddr(domain)
+		}
 		timeout <- err
 	}()
 
